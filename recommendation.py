@@ -1,9 +1,72 @@
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import math
+from collections import defaultdict, Counter
 import warnings
 warnings.filterwarnings('ignore')
+
+class SimpleTFIDF:
+    def __init__(self):
+        self.doc_freqs = defaultdict(int)
+        self.doc_count = 0
+        self.idf = {}
+        
+    def fit_transform(self, docs):
+        """Calculates TF-IDF from scratch given a list of lists of tokens"""
+        self.doc_count = len(docs)
+        
+        # Calculate Document Frequency (DF)
+        for doc in docs:
+            unique_terms = set(doc)
+            for term in unique_terms:
+                self.doc_freqs[term] += 1
+                
+        # Calculate Inverse Document Frequency (IDF)
+        for term, df in self.doc_freqs.items():
+            # Adding 1 to smooth
+            self.idf[term] = math.log((1 + self.doc_count) / (1 + df)) + 1
+            
+        # Create normalized TF-IDF sparse vectors
+        tfidf_vectors = []
+        for doc in docs:
+            term_counts = Counter(doc)
+            vec = {}
+            norm = 0.0
+            for term, count in term_counts.items():
+                tfidf_weight = count * self.idf[term]
+                vec[term] = tfidf_weight
+                norm += tfidf_weight ** 2
+            
+            norm = math.sqrt(norm)
+            if norm > 0:
+                for term in vec:
+                    vec[term] /= norm
+            
+            tfidf_vectors.append(vec)
+            
+        return tfidf_vectors
+
+def average_sparse_vectors(vec_list):
+    avg_vec = defaultdict(float)
+    n = len(vec_list)
+    if n == 0: return dict(avg_vec)
+    for vec in vec_list:
+        for term, weight in vec.items():
+            avg_vec[term] += weight / n
+    return dict(avg_vec)
+
+def cosine_similarity_sparse(vec1, vec2):
+    # Both vectors are assumed to be dictionaries mapping term -> weight
+    # and they should be L2 normalized.
+    score = 0.0
+    # Iterate over the smaller vector to optimize
+    if len(vec1) > len(vec2):
+        vec1, vec2 = vec2, vec1
+        
+    for term, weight in vec1.items():
+        if term in vec2:
+            score += weight * vec2[term]
+    return score
 
 class DataProcessor:
     def __init__(self, chapters_file='chapters.csv', interactions_file='interactions.csv'):
@@ -30,7 +93,7 @@ class DataProcessor:
             'chapter_sequence_no': 'max'
         }).reset_index()
         self.book_metadata.rename(columns={'chapter_sequence_no': 'total_chapters'}, inplace=True)
-        # Clean tags for TF-IDF
+        # Clean tags
         self.book_metadata['tags'] = self.book_metadata['tags'].str.replace('\|', ' ', regex=True)
 
 class ContinueReadingRecommender:
@@ -55,11 +118,14 @@ class NewBookRecommender:
     def __init__(self, book_metadata_df):
         self.book_metadata = book_metadata_df
         self.books = book_metadata_df['book_id'].values
-        self.tfidf = TfidfVectorizer(stop_words='english')
         
-        print("Generating TF-IDF matrices for books...")
+        print("Generating TF-IDF matrices from scratch...")
         text_features = book_metadata_df['tags'] + " author_" + book_metadata_df['author_id'].astype(str)
-        self.book_features = self.tfidf.fit_transform(text_features)
+        # Tokenize by whitespace
+        docs = [str(text).split() for text in text_features]
+        
+        self.tfidf = SimpleTFIDF()
+        self.book_vectors = self.tfidf.fit_transform(docs)
         self.popular_books = []
         
     def prepare_popularity_baseline(self, interactions_df):
@@ -68,24 +134,28 @@ class NewBookRecommender:
 
     def recommend(self, user_interacted_books, top_k=5):
         """
-        Recommends top_k new books for a user based on their interacted books (Content-Based)
+        Recommends top_k new books for a user based on their interacted books (Content-Based from scratch)
         """
         if len(user_interacted_books) == 0:
             return self.popular_books[:top_k]
             
-        interacted_indices = self.book_metadata.index[self.book_metadata['book_id'].isin(user_interacted_books)].tolist()
+        interacted_indices_set = set(self.book_metadata.index[self.book_metadata['book_id'].isin(user_interacted_books)])
+        interacted_indices = list(interacted_indices_set)
         
         if not interacted_indices:
             return self.popular_books[:top_k]
             
         # Create user profile as average of interacted book features
-        user_profile = self.book_features[interacted_indices].mean(axis=0)
+        user_read_vectors = [self.book_vectors[idx] for idx in interacted_indices]
+        user_profile = average_sparse_vectors(user_read_vectors)
         
-        # Calculate cosine similarity with all books
-        sim_scores = cosine_similarity(np.asarray(user_profile), self.book_features)[0]
-        
-        # Exclude read books
-        sim_scores[interacted_indices] = -1 
+        # Calculate custom sparse cosine similarity with all books
+        sim_scores = np.zeros(len(self.book_vectors))
+        for i, book_vec in enumerate(self.book_vectors):
+            if i in interacted_indices_set:
+                sim_scores[i] = -1.0 # Exclude read books
+            else:
+                sim_scores[i] = cosine_similarity_sparse(user_profile, book_vec)
         
         # Get top indices
         top_indices = np.argpartition(sim_scores, -top_k)[-top_k:]
@@ -137,7 +207,7 @@ class Evaluator:
         print(f"Evaluation Complete. HR@{top_k}: {hr:.4f}")
         return hr
 
-def main():
+if __name__ == "__main__":
     dp = DataProcessor()
     dp.load_data()
     
@@ -163,6 +233,3 @@ def main():
     nbr.prepare_popularity_baseline(evaluator.merged_data)
     new_recs = nbr.recommend(user_books, top_k=5)
     print(f"New Book Recommendations (Top 5 Book IDs): {new_recs}")
-
-if __name__ == "__main__":
-    main()
